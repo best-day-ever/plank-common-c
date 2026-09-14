@@ -1,11 +1,2 @@
-.idea/
-.vscode/
-limelight-common/ARM/
-limelight-common/Debug/
-Build/
+build/
 cmake-*/
-**/xcuserdata/
-limelight-common/Release/
-*.sdf
-*.suo
-limelight-common/limelight-common.vcxproj.user
