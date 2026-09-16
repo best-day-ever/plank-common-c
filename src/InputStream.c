@@ -80,11 +80,6 @@ static struct {
     int deltaX, deltaY;
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
 } currentRelativeMouseState;
-static struct {
-    int x, y;
-    int width, height;
-    bool dirty; // Update ready to send (queued packet holder in packetQueue)
-} currentAbsoluteMouseState;
 
 // Initializes the input stream
 int initializeInputStream(void) {
@@ -102,7 +97,6 @@ int initializeInputStream(void) {
 
     memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
     memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
-    memset(&currentAbsoluteMouseState, 0, sizeof(currentAbsoluteMouseState));
     PltCreateMutex(&batchedInputMutex);
 
     return 0;
@@ -420,7 +414,8 @@ static void inputSendThreadProc(void* context) {
             freePacketHolder(holder);
             continue;
         }
-        // If it's an absolute mouse move packet, we should only send the latest
+        // Coalesce only consecutive absolute moves. Button/key events are
+        // ordering barriers: their preceding position must remain intact.
         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
             uint64_t now = PltGetMillis();
 
@@ -430,24 +425,19 @@ static void inputSendThreadProc(void* context) {
                 now = PltGetMillis();
             }
 
-            PltLockMutex(&batchedInputMutex);
-
-            // Populate the packet with the latest state
-            holder->packet.mouseMoveAbs.x = BE16(currentAbsoluteMouseState.x);
-            holder->packet.mouseMoveAbs.y = BE16(currentAbsoluteMouseState.y);
-
-            // There appears to be a rounding error in GFE's scaling calculation which prevents
-            // the cursor from reaching the far edge of the screen when streaming at smaller
-            // resolutions with a higher desktop resolution (like streaming 720p with a desktop
-            // resolution of 1080p, or streaming 720p/1080p with a desktop resolution of 4K).
-            // Subtracting one from the reference dimensions seems to work around this issue.
-            holder->packet.mouseMoveAbs.width = BE16(currentAbsoluteMouseState.width - 1);
-            holder->packet.mouseMoveAbs.height = BE16(currentAbsoluteMouseState.height - 1);
-
-            // The state change is no longer pending
-            currentAbsoluteMouseState.dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
+            for (;;) {
+                PPACKET_HOLDER next;
+                if (LbqPeekQueueElement(&packetQueue, (void**)&next) != LBQ_SUCCESS ||
+                    next->packet.header.magic != LE32(MOUSE_MOVE_ABS_MAGIC)) {
+                    break;
+                }
+                // This worker is the sole queue consumer.
+                if (LbqPollQueueElement(&packetQueue, (void**)&next) != LBQ_SUCCESS) {
+                    break;
+                }
+                holder->packet.mouseMoveAbs = next->packet.mouseMoveAbs;
+                freePacketHolder(next);
+            }
 
             lastMousePacketTime = now;
         }
@@ -678,47 +668,25 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         return -2;
     }
 
-    PltLockMutex(&batchedInputMutex);
-
-    // Overwrite the previous mouse location with the new one
-    currentAbsoluteMouseState.x = x;
-    currentAbsoluteMouseState.y = y;
-    currentAbsoluteMouseState.width = referenceWidth;
-    currentAbsoluteMouseState.height = referenceHeight;
-
-    // Queue a packet holder if this is the only pending absolute mouse event
-    if (!currentAbsoluteMouseState.dirty) {
-        // Set the dirty flag to claim ownership of inserting the packet holder
-        // and unlock to allow other threads to enqueue or process input.
-        currentAbsoluteMouseState.dirty = true;
-        PltUnlockMutex(&batchedInputMutex);
-
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            currentAbsoluteMouseState.dirty = false;
-            return -1;
-        }
-
-        holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
-        holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
-        holder->packet.mouseMoveAbs.unused = 0;
-
-        // Remaining fields are set in the input thread based on the latest currentAbsoluteMouseState values
-
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-
-            // We weren't able to insert the entry, so let the next call try again
-            currentAbsoluteMouseState.dirty = false;
-        }
+    holder = allocatePacketHolder(0);
+    if (holder == NULL) {
+        return -1;
     }
-    else {
-        // There's already a packet holder queued to send this event
-        PltUnlockMutex(&batchedInputMutex);
-        err = 0;
+
+    holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
+    holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
+    holder->packet.mouseMoveAbs.unused = 0;
+    holder->packet.mouseMoveAbs.x = BE16(x);
+    holder->packet.mouseMoveAbs.y = BE16(y);
+    // Coordinates span 0 through dimension-1, including the far screen edge.
+    holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
+    holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     // This is not thread safe, but it's not a big deal because callers that want to
