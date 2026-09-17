@@ -1,5 +1,23 @@
 find_package(Threads REQUIRED)
 
+# Header-only checks: no common-C runtime or transport library is linked.
+foreach(language c cpp)
+  set(abi_test "plank-clipboard-abi-${language}")
+  add_executable(${abi_test} "clipboard-wire-abi.${language}")
+  target_include_directories(${abi_test} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src" "${PLANK_TRANSPORT_DIR}/include")
+  set_target_properties(${abi_test} PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  if (MSVC)
+    target_compile_options(${abi_test} PRIVATE /W4 /WX)
+  else()
+    target_compile_options(${abi_test} PRIVATE -Wall -Wextra -Werror -pedantic)
+  endif()
+  add_test(NAME ${abi_test} COMMAND ${abi_test})
+  set_tests_properties(${abi_test} PROPERTIES TIMEOUT 20)
+endforeach()
+
 function(add_plank_input_test name source)
   add_executable(${name} ${source})
   target_link_libraries(${name} PRIVATE moonlight-common-c Threads::Threads)
