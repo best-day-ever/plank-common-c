@@ -30,8 +30,23 @@ typedef struct _LINKED_BLOCKING_QUEUE {
 
 int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeBound);
 int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry);
+// Atomically replace a matching tail or enqueue. On replacement, the caller
+// owns *replacedData and must dispose of it after this function returns.
+int LbqOfferQueueItemReplacingTail(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                                   PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                                   bool (*canReplaceTail)(const void* tailData),
+                                   void** replacedData);
 int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
+// Inspect and remove the head atomically. The predicate runs under the queue
+// mutex and must not retain headData or re-enter the queue. On success the
+// caller owns *data; a nonmatching head returns LBQ_NO_ELEMENT without removal.
+int LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queueHead, void** data,
+                          bool (*matches)(const void* headData, const void* context),
+                          const void* context);
+// Borrowed pointer: callers must exclude concurrent removal, flush, and tail
+// replacement until they finish inspecting it. Use the conditional poll above
+// when a producer can replace queued entries.
 int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 PLINKED_BLOCKING_QUEUE_ENTRY LbqDestroyLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead);
 PLINKED_BLOCKING_QUEUE_ENTRY LbqFlushQueueItems(PLINKED_BLOCKING_QUEUE queueHead);
