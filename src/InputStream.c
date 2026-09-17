@@ -171,6 +171,11 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
     }
 }
 
+static bool isAbsoluteMousePosition(const void* data) {
+    const PACKET_HOLDER* holder = data;
+    return holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC);
+}
+
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     SOCK_RET err;
 
@@ -662,6 +667,7 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 // Send a mouse position update to the streaming machine
 int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight) {
     PPACKET_HOLDER holder;
+    PPACKET_HOLDER replacedHolder = NULL;
     int err;
 
     if (!initialized) {
@@ -682,11 +688,16 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
     holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
     holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = LbqOfferQueueItemReplacingTail(&packetQueue, holder, &holder->entry,
+                                         isAbsoluteMousePosition,
+                                         (void**)&replacedHolder);
     if (err != LBQ_SUCCESS) {
         LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
+    }
+    if (replacedHolder != NULL) {
+        freePacketHolder(replacedHolder);
     }
 
     // This is not thread safe, but it's not a big deal because callers that want to

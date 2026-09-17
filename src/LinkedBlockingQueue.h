@@ -30,6 +30,12 @@ typedef struct _LINKED_BLOCKING_QUEUE {
 
 int LbqInitializeLinkedBlockingQueue(PLINKED_BLOCKING_QUEUE queueHead, int sizeBound);
 int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry);
+// Atomically replace a matching tail or enqueue. On replacement, the caller
+// owns *replacedData and must dispose of it after this function returns.
+int LbqOfferQueueItemReplacingTail(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                                   PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                                   bool (*canReplaceTail)(const void* tailData),
+                                   void** replacedData);
 int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
