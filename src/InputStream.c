@@ -176,6 +176,18 @@ static bool isAbsoluteMousePosition(const void* data) {
     return holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC);
 }
 
+static bool canBatchMousePosition(const void* data, const void* context) {
+    return isAbsoluteMousePosition(data);
+}
+
+static bool canBatchPenEvent(const void* data, const void* context) {
+    const PACKET_HOLDER* next = data;
+    const PACKET_HOLDER* current = context;
+    return next->packet.header.magic == LE32(SS_PEN_MAGIC) &&
+           next->packet.pen.penButtons == current->packet.pen.penButtons &&
+           next->packet.pen.eventType == current->packet.pen.eventType;
+}
+
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     SOCK_RET err;
 
@@ -432,12 +444,10 @@ static void inputSendThreadProc(void* context) {
 
             for (;;) {
                 PPACKET_HOLDER next;
-                if (LbqPeekQueueElement(&packetQueue, (void**)&next) != LBQ_SUCCESS ||
-                    next->packet.header.magic != LE32(MOUSE_MOVE_ABS_MAGIC)) {
-                    break;
-                }
-                // This worker is the sole queue consumer.
-                if (LbqPollQueueElement(&packetQueue, (void**)&next) != LBQ_SUCCESS) {
+                // Producers can replace/recycle the head when it is also the
+                // tail. Inspect and acquire ownership in one queue operation.
+                if (LbqPollQueueElementIf(&packetQueue, (void**)&next,
+                                         canBatchMousePosition, NULL) != LBQ_SUCCESS) {
                     break;
                 }
                 holder->packet.mouseMoveAbs = next->packet.mouseMoveAbs;
@@ -459,24 +469,8 @@ static void inputSendThreadProc(void* context) {
             for (;;) {
                 PPACKET_HOLDER penBatchHolder;
 
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // If it's not a pen packet, we're done
-                if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-                    break;
-                }
-
-                // If the buttons or event type is different, we cannot batch
-                if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
-                    holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
-                    break;
-                }
-
-                // Remove the next packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
+                if (LbqPollQueueElementIf(&packetQueue, (void**)&penBatchHolder,
+                                         canBatchPenEvent, holder) != LBQ_SUCCESS) {
                     break;
                 }
 

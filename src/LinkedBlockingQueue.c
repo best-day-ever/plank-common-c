@@ -196,7 +196,9 @@ int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     return LBQ_SUCCESS;
 }
 
-int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+static int pollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data,
+                            bool (*matches)(const void* headData, const void* context),
+                            const void* context) {
     PLINKED_BLOCKING_QUEUE_ENTRY entry;
 
     PltLockMutex(&queueHead->mutex);
@@ -218,6 +220,11 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     }
 
     entry = queueHead->head;
+    if (matches != NULL && !matches(entry->data, context)) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_NO_ELEMENT;
+    }
+
     queueHead->head = entry->flink;
     queueHead->currentSize--;
     if (queueHead->head == NULL) {
@@ -234,6 +241,17 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     PltUnlockMutex(&queueHead->mutex);
 
     return LBQ_SUCCESS;
+}
+
+int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+    return pollQueueElement(queueHead, data, NULL, NULL);
+}
+
+int LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queueHead, void** data,
+                          bool (*matches)(const void* headData, const void* context),
+                          const void* context) {
+    LC_ASSERT(matches != NULL);
+    return pollQueueElement(queueHead, data, matches, context);
 }
 
 int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
