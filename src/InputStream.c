@@ -668,6 +668,15 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         return -2;
     }
 
+    // The wire carries inclusive maxima, not dimensions. Clamp before queuing
+    // so rounding or a captured drag outside the image cannot emit x > maxX
+    // or y > maxY. Reject degenerate geometry without disturbing input order.
+    if (referenceWidth <= 1 || referenceHeight <= 1) {
+        return -1;
+    }
+    x = CLAMP(x, 0, referenceWidth - 1);
+    y = CLAMP(y, 0, referenceHeight - 1);
+
     holder = allocatePacketHolder(0);
     if (holder == NULL) {
         return -1;
@@ -698,8 +707,8 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
     // use LiSendRelativeMotionAsMousePositionEvent() must not mix these function
     // without synchronization (otherwise the state of the cursor on the host is
     // undefined anyway).
-    absCurrentPosX = CLAMP(x, 0, referenceWidth - 1) / (float)(referenceWidth - 1);
-    absCurrentPosY = CLAMP(y, 0, referenceHeight - 1) / (float)(referenceHeight - 1);
+    absCurrentPosX = x / (float)(referenceWidth - 1);
+    absCurrentPosY = y / (float)(referenceHeight - 1);
 
     return err;
 }
