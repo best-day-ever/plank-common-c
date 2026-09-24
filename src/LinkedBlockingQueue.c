@@ -82,9 +82,15 @@ int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead) {
     return queueHead->currentSize;
 }
 
-int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+static int offerQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                          PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                          bool (*canReplaceTail)(const void* tailData),
+                          void** replacedData) {
     bool wasEmpty;
-    
+
+    if (replacedData != NULL) {
+        *replacedData = NULL;
+    }
     entry->flink = NULL;
     entry->data = data;
 
@@ -93,6 +99,26 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
     if (queueHead->shutdown || queueHead->draining) {
         PltUnlockMutex(&queueHead->mutex);
         return LBQ_INTERRUPTED;
+    }
+
+    // Replace the tail while holding the same lock used by the consumer and
+    // other producers. An intervening button or key is therefore a barrier.
+    if (canReplaceTail != NULL && queueHead->tail != NULL &&
+        canReplaceTail(queueHead->tail->data)) {
+        PLINKED_BLOCKING_QUEUE_ENTRY oldTail = queueHead->tail;
+
+        LC_ASSERT(replacedData != NULL);
+        *replacedData = oldTail->data;
+        entry->blink = oldTail->blink;
+        if (entry->blink != NULL) {
+            entry->blink->flink = entry;
+        }
+        else {
+            queueHead->head = entry;
+        }
+        queueHead->tail = entry;
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_SUCCESS;
     }
 
     if (queueHead->currentSize == queueHead->sizeBound) {
@@ -130,6 +156,19 @@ int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data, PLINKED_BLOC
     return LBQ_SUCCESS;
 }
 
+int LbqOfferQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                      PLINKED_BLOCKING_QUEUE_ENTRY entry) {
+    return offerQueueItem(queueHead, data, entry, NULL, NULL);
+}
+
+int LbqOfferQueueItemReplacingTail(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                                   PLINKED_BLOCKING_QUEUE_ENTRY entry,
+                                   bool (*canReplaceTail)(const void* tailData),
+                                   void** replacedData) {
+    LC_ASSERT(canReplaceTail != NULL && replacedData != NULL);
+    return offerQueueItem(queueHead, data, entry, canReplaceTail, replacedData);
+}
+
 // This must be synchronized with LbqFlushQueueItems by the caller
 int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     PltLockMutex(&queueHead->mutex);
@@ -157,7 +196,9 @@ int LbqPeekQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     return LBQ_SUCCESS;
 }
 
-int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+static int pollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data,
+                            bool (*matches)(const void* headData, const void* context),
+                            const void* context) {
     PLINKED_BLOCKING_QUEUE_ENTRY entry;
 
     PltLockMutex(&queueHead->mutex);
@@ -179,6 +220,11 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     }
 
     entry = queueHead->head;
+    if (matches != NULL && !matches(entry->data, context)) {
+        PltUnlockMutex(&queueHead->mutex);
+        return LBQ_NO_ELEMENT;
+    }
+
     queueHead->head = entry->flink;
     queueHead->currentSize--;
     if (queueHead->head == NULL) {
@@ -195,6 +241,17 @@ int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
     PltUnlockMutex(&queueHead->mutex);
 
     return LBQ_SUCCESS;
+}
+
+int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {
+    return pollQueueElement(queueHead, data, NULL, NULL);
+}
+
+int LbqPollQueueElementIf(PLINKED_BLOCKING_QUEUE queueHead, void** data,
+                          bool (*matches)(const void* headData, const void* context),
+                          const void* context) {
+    LC_ASSERT(matches != NULL);
+    return pollQueueElement(queueHead, data, matches, context);
 }
 
 int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data) {

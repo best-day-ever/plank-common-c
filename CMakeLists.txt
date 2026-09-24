@@ -115,3 +115,10 @@ endif()
 target_include_directories(moonlight-common-c SYSTEM PUBLIC src)
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
+
+option(PLANK_BUILD_TESTS "Build standalone PLANK protocol/input/queue regression tests" OFF)
+if (PLANK_BUILD_TESTS)
+  enable_language(CXX)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
