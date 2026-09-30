@@ -33,6 +33,7 @@ endfunction()
 add_plank_input_test(plank-native-input-wire native-input-wire.c)
 add_plank_input_test(plank-native-input-bounds native-input-bounds.c)
 add_plank_input_test(plank-queue-ownership queue-ownership.c)
+add_plank_input_test(plank-audio-timestamps audio-timestamps.c)
 
 # GNU/LLVM ELF link wrapping supplies deterministic scheduler boundaries with
 # no production hooks. Static linking is required to wrap worker calls.
