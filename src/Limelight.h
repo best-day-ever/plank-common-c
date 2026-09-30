@@ -322,8 +322,11 @@ typedef void(*AudioRendererStop)(void);
 // This callback performs the final teardown of the audio decoder. No additional audio will be submitted when this callback is invoked.
 typedef void(*AudioRendererCleanup)(void);
 
-// This callback provides Opus audio data to be decoded and played. sampleLength is in bytes.
-typedef void(*AudioRendererDecodeAndPlaySample)(char* sampleData, int sampleLength);
+// This callback provides Opus audio data to be decoded and played. sampleLength
+// is in bytes. presentationTimeUs preserves the source media timestamp, or -1
+// for loss concealment before any timestamped packet has arrived. This is a
+// media clock, not a Client wall-clock deadline; its epoch is Host-specific.
+typedef void(*AudioRendererDecodeAndPlaySample)(char* sampleData, int sampleLength, int64_t presentationTimeUs);
 
 typedef struct _AUDIO_RENDERER_CALLBACKS {
     AudioRendererInit init;
@@ -928,11 +931,16 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
 // Submit a raw KyProto-reconstructed Opus packet to the configured audio
 // renderer from PLANK's dedicated native receive thread. A non-zero
 // missingSamples value invokes Opus packet-loss concealment for the
-// corresponding number of complete frames.
+// corresponding number of complete frames (at most one second per call).
+// ptsMs is the original native source timestamp; it is ignored for a hole,
+// which extrapolates from the last known packet instead. New connections reset
+// that extrapolation. Supported packet durations are whole milliseconds at
+// 48 kHz, no longer than Opus's 120 ms maximum.
 int LiSubmitPlankAudioPacket(const unsigned char* packet,
                                       int packetLength,
                                       uint16_t frameSamples,
-                                      uint32_t missingSamples);
+                                      uint32_t missingSamples,
+                                      uint64_t ptsMs);
 
 // Route PLANK recovery and bitrate requests through a native reliable
 // data plane without wrapping them in encrypted GameStream control packets.
