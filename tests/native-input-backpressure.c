@@ -53,10 +53,15 @@ int main(void) {
     CHECK(atomic_load(&accepted) == 0);
     CHECK(LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT) == 0);
     CHECK(LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT) == 0);
+    CHECK(LiSendKeyboardEvent2(0x41, KEY_ACTION_DOWN, 0, 0) == 0);
+    CHECK(LiSendKeyboardEvent2(0x41, KEY_ACTION_UP, 0, 0) == 0);
     atomic_store(&busy, false);
-    waitCount(&accepted, 3);
+    waitCount(&accepted, 5);
     CHECK(lengths[0] == sizeof(raw) && memcmp(raw, received[0], sizeof(raw)) == 0);
     CHECK(received[1][1] == 1 && received[2][1] == 0);
+    CHECK(lengths[3] == PLANK_TRANSPORT_INPUT_KEYBOARD_SIZE &&
+          lengths[4] == PLANK_TRANSPORT_INPUT_KEYBOARD_SIZE);
+    CHECK(received[3][2] == 1 && received[4][2] == 0);
     CHECK(atomic_load(&failures) == 0);
 
     // Disconnect while pressure persists must cancel, not wait two seconds.
