@@ -79,7 +79,10 @@ void LbqSignalQueueUserWake(PLINKED_BLOCKING_QUEUE queueHead) {
 }
 
 int LbqGetItemCount(PLINKED_BLOCKING_QUEUE queueHead) {
-    return queueHead->currentSize;
+    PltLockMutex(&queueHead->mutex);
+    int count = queueHead->currentSize;
+    PltUnlockMutex(&queueHead->mutex);
+    return count;
 }
 
 static int offerQueueItem(PLINKED_BLOCKING_QUEUE queueHead, void* data,
@@ -167,6 +170,21 @@ int LbqOfferQueueItemReplacingTail(PLINKED_BLOCKING_QUEUE queueHead, void* data,
                                    void** replacedData) {
     LC_ASSERT(canReplaceTail != NULL && replacedData != NULL);
     return offerQueueItem(queueHead, data, entry, canReplaceTail, replacedData);
+}
+
+int LbqOfferQueueItemTimed(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                          PLINKED_BLOCKING_QUEUE_ENTRY entry, unsigned timeoutMs,
+                          bool (*canReplaceTail)(const void* tailData),
+                          void** replacedData) {
+    uint64_t deadline = PltGetMillis() + timeoutMs;
+    int result;
+    do {
+        result = offerQueueItem(queueHead, data, entry, canReplaceTail, replacedData);
+        if (result != LBQ_BOUND_EXCEEDED || PltGetMillis() >= deadline) {
+            return result;
+        }
+        PltSleepMs(1);
+    } while (true);
 }
 
 // This must be synchronized with LbqFlushQueueItems by the caller

@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
 typedef struct _QUEUED_REFERENCE_FRAME_CONTROL {
     uint32_t startFrame;
@@ -38,8 +39,8 @@ static PLT_EVENT idrFrameRequiredEvent;
 
 static PlankNativeControlSender nativeControlSender;
 static void* nativeControlSenderContext;
-static bool stopping = true;
-static bool initialized;
+static atomic_bool stopping = true;
+static atomic_bool initialized;
 static bool started;
 static bool referenceFrameThreadStarted;
 static uint32_t lastSeenFrame;
@@ -249,6 +250,11 @@ static void referenceFrameControlFunc(void* context) {
     }
 }
 
+static bool callbackMatches(const void* data, const void* context) {
+    return ((const QUEUED_ASYNC_CALLBACK*)data)->type ==
+           ((const QUEUED_ASYNC_CALLBACK*)context)->type;
+}
+
 static void asyncCallbackThreadFunc(void* context) {
     PQUEUED_ASYNC_CALLBACK queuedCb;
     PQUEUED_ASYNC_CALLBACK nextCb;
@@ -258,13 +264,8 @@ static void asyncCallbackThreadFunc(void* context) {
                                   (void**)&queuedCb) == LBQ_SUCCESS) {
         switch (queuedCb->type) {
         case SC_CALLBACK_HDR_MODE:
-            while (LbqPeekQueueElement(&asyncCallbackQueue,
-                                       (void**)&nextCb) == LBQ_SUCCESS &&
-                    nextCb->type == queuedCb->type) {
-                if (LbqPollQueueElement(&asyncCallbackQueue,
-                                        (void**)&nextCb) != LBQ_SUCCESS) {
-                    break;
-                }
+            while (LbqPollQueueElementIf(&asyncCallbackQueue,
+                      (void**)&nextCb, callbackMatches, queuedCb) == LBQ_SUCCESS) {
                 LC_ASSERT(nextCb != queuedCb);
                 free(queuedCb);
                 queuedCb = nextCb;
@@ -292,13 +293,8 @@ static void asyncCallbackThreadFunc(void* context) {
             }
             break;
         case SC_CALLBACK_CURSOR_POSITION:
-            while (LbqPeekQueueElement(&asyncCallbackQueue,
-                                       (void**)&nextCb) == LBQ_SUCCESS &&
-                    nextCb->type == queuedCb->type) {
-                if (LbqPollQueueElement(&asyncCallbackQueue,
-                                        (void**)&nextCb) != LBQ_SUCCESS) {
-                    break;
-                }
+            while (LbqPollQueueElementIf(&asyncCallbackQueue,
+                      (void**)&nextCb, callbackMatches, queuedCb) == LBQ_SUCCESS) {
                 LC_ASSERT(nextCb != queuedCb);
                 free(queuedCb->variableData);
                 free(queuedCb);
@@ -403,14 +399,31 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
     return true;
 }
 
+static bool isCursorPositionCallback(const void* data) {
+    return ((const QUEUED_ASYNC_CALLBACK*)data)->type == SC_CALLBACK_CURSOR_POSITION;
+}
+
 static bool queueAsyncCallback(PQUEUED_ASYNC_CALLBACK queuedCb) {
-    if (LbqOfferQueueItem(&asyncCallbackQueue, queuedCb,
-                          &queuedCb->entry) == LBQ_SUCCESS) {
+    PQUEUED_ASYNC_CALLBACK replaced = NULL;
+    int result = LbqOfferQueueItemTimed(&asyncCallbackQueue, queuedCb,
+        &queuedCb->entry, 100,
+        queuedCb->type == SC_CALLBACK_CURSOR_POSITION ? isCursorPositionCallback : NULL,
+        (void**)&replaced);
+    if (replaced != NULL) {
+        free(replaced->variableData);
+        free(replaced);
+    }
+    if (result == LBQ_SUCCESS) {
         return true;
     }
 
     free(queuedCb->variableData);
     free(queuedCb);
+    if (result == LBQ_BOUND_EXCEEDED && !atomic_exchange(&stopping, true)) {
+        // A lost feature-report request or attach acknowledgement can leave
+        // the tablet wedged for the rest of the session. Fail visibly instead.
+        terminateForNativeSendFailure("reliable callback queue remained full", -1);
+    }
     return false;
 }
 

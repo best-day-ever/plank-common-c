@@ -36,6 +36,12 @@ int LbqOfferQueueItemReplacingTail(PLINKED_BLOCKING_QUEUE queueHead, void* data,
                                    PLINKED_BLOCKING_QUEUE_ENTRY entry,
                                    bool (*canReplaceTail)(const void* tailData),
                                    void** replacedData);
+// Bounded backpressure for reliable events. Ownership transfers only on
+// success; shutdown/drain interrupts the retry. Tail replacement is optional.
+int LbqOfferQueueItemTimed(PLINKED_BLOCKING_QUEUE queueHead, void* data,
+                          PLINKED_BLOCKING_QUEUE_ENTRY entry, unsigned timeoutMs,
+                          bool (*canReplaceTail)(const void* tailData),
+                          void** replacedData);
 int LbqWaitForQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 int LbqPollQueueElement(PLINKED_BLOCKING_QUEUE queueHead, void** data);
 // Inspect and remove the head atomically. The predicate runs under the queue
