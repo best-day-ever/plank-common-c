@@ -43,6 +43,9 @@ static atomic_bool stopping = true;
 static atomic_bool initialized;
 static bool started;
 static bool referenceFrameThreadStarted;
+// One atomic snapshot keeps callback type and start time consistent for the
+// failure diagnostic. Zero means idle; low byte is type+1, upper bits are ms.
+static atomic_uint_fast64_t activeAsyncCallback;
 static uint32_t lastSeenFrame;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
@@ -81,6 +84,7 @@ int initializeControlStream(void) {
     initialized = true;
     started = false;
     referenceFrameThreadStarted = false;
+    atomic_store(&activeAsyncCallback, 0);
     lastSeenFrame = 0;
     hdrEnabled = false;
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
@@ -262,6 +266,8 @@ static void asyncCallbackThreadFunc(void* context) {
 
     while (LbqWaitForQueueElement(&asyncCallbackQueue,
                                   (void**)&queuedCb) == LBQ_SUCCESS) {
+        atomic_store(&activeAsyncCallback,
+                     (PltGetMillis() << 8) | (queuedCb->type + 1));
         switch (queuedCb->type) {
         case SC_CALLBACK_HDR_MODE:
             while (LbqPollQueueElementIf(&asyncCallbackQueue,
@@ -310,6 +316,7 @@ static void asyncCallbackThreadFunc(void* context) {
             break;
         }
 
+        atomic_store(&activeAsyncCallback, 0);
         free(queuedCb->variableData);
         free(queuedCb);
     }
@@ -403,8 +410,20 @@ static bool isCursorPositionCallback(const void* data) {
     return ((const QUEUED_ASYNC_CALLBACK*)data)->type == SC_CALLBACK_CURSOR_POSITION;
 }
 
+static const char* callbackName(unsigned type) {
+    switch (type) {
+    case SC_CALLBACK_HDR_MODE: return "hdr-mode";
+    case SC_CALLBACK_RAW_HID_CONTROL: return "tablet-control";
+    case SC_CALLBACK_VIDEO_BITRATE_APPLIED: return "bitrate-confirmation";
+    case SC_CALLBACK_CURSOR_SHAPE: return "cursor-shape";
+    case SC_CALLBACK_CURSOR_POSITION: return "cursor-position";
+    default: return "idle";
+    }
+}
+
 static bool queueAsyncCallback(PQUEUED_ASYNC_CALLBACK queuedCb) {
     PQUEUED_ASYNC_CALLBACK replaced = NULL;
+    const PLANK_CALLBACK_TYPE type = queuedCb->type;
     int result = LbqOfferQueueItemTimed(&asyncCallbackQueue, queuedCb,
         &queuedCb->entry, 100,
         queuedCb->type == SC_CALLBACK_CURSOR_POSITION ? isCursorPositionCallback : NULL,
@@ -420,6 +439,10 @@ static bool queueAsyncCallback(PQUEUED_ASYNC_CALLBACK queuedCb) {
     free(queuedCb->variableData);
     free(queuedCb);
     if (result == LBQ_BOUND_EXCEEDED && !atomic_exchange(&stopping, true)) {
+        const uint64_t active = atomic_load(&activeAsyncCallback);
+        Limelog("Native callback backlog: incoming=%s active=%s active-ms=%llu limit=30 wait-ms=100\n",
+                callbackName(type), callbackName((unsigned)(active & 0xff) - 1),
+                (unsigned long long)(active ? PltGetMillis() - (active >> 8) : 0));
         // A lost feature-report request or attach acknowledgement can leave
         // the tablet wedged for the rest of the session. Fail visibly instead.
         terminateForNativeSendFailure("reliable callback queue remained full", -1);

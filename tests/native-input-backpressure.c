@@ -4,10 +4,12 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d failed\n", __LINE__); exit(1); } } while (0)
 static atomic_uint attempts, accepted, failures, callbacks;
 static atomic_bool busy, holdCallback, callbackEntered;
+static atomic_uint backlogDiagnostics;
 static uint8_t received[200][32];
 static size_t lengths[200];
 
@@ -22,6 +24,18 @@ static int sender(void* context, uint8_t type, const uint8_t* data, size_t size)
     return 0;
 }
 static void terminated(int error) { CHECK(error < 0); atomic_fetch_add(&failures, 1); }
+static void logMessage(const char* format, ...) {
+    char message[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    if (strstr(message, "Native callback backlog:") != NULL) {
+        CHECK(strstr(message, "incoming=tablet-control active=tablet-control active-ms=") != NULL);
+        CHECK(strstr(message, "limit=30 wait-ms=100") != NULL);
+        atomic_fetch_add(&backlogDiagnostics, 1);
+    }
+}
 static void waitCount(atomic_uint* count, unsigned minimum) {
     uint64_t deadline = PltGetMillis() + 3000;
     while (atomic_load(count) < minimum && PltGetMillis() < deadline) PltSleepMs(1);
@@ -43,6 +57,7 @@ static void cursorCallback(const unsigned char* data, unsigned int length) {
 int main(void) {
     CHECK(initializePlatform() == 0);
     ListenerCallbacks.connectionTerminated = terminated;
+    ListenerCallbacks.logMessage = logMessage;
     SunshineFeatureFlags = LI_FF_RAW_HID_TABLET;
     LiSetPlankNativeInputSender(sender, NULL);
     CHECK(initializeInputStream() == 0 && startInputStream() == 0);
@@ -104,6 +119,29 @@ int main(void) {
     CHECK(atomic_load(&failures) == 1);
     atomic_store(&holdCallback, false);
     waitCount(&callbacks, 2);
+    CHECK(stopControlStream() == 0); destroyControlStream();
+
+    // A genuinely blocked consumer must identify the stalled callback and
+    // terminate once, without silently dropping a tablet acknowledgement.
+    CHECK(initializeControlStream() == 0 && startControlStream() == 0);
+    atomic_store(&callbackEntered, false);
+    atomic_store(&holdCallback, true);
+    LiNotifyPlankRawHidControl(raw, sizeof(raw));
+    start = PltGetMillis();
+    while (!atomic_load(&callbackEntered) && PltGetMillis() - start < 1000) PltSleepMs(1);
+    CHECK(atomic_load(&callbackEntered));
+    for (unsigned i = 0; i < 31; ++i) LiNotifyPlankRawHidControl(raw, sizeof(raw));
+    CHECK(atomic_load(&failures) == 2 && atomic_load(&backlogDiagnostics) == 1);
+    LiNotifyPlankRawHidControl(raw, sizeof(raw)); // Stopping: no duplicate failure.
+    CHECK(atomic_load(&failures) == 2);
+    atomic_store(&holdCallback, false);
+    CHECK(stopControlStream() == 0); destroyControlStream();
+    CHECK(atomic_load(&callbacks) == 33);
+
+    // The next connection has a fresh callback worker/queue and no stale state.
+    CHECK(initializeControlStream() == 0 && startControlStream() == 0);
+    LiNotifyPlankRawHidControl(raw, sizeof(raw));
+    waitCount(&callbacks, 34);
     CHECK(stopControlStream() == 0); destroyControlStream();
     cleanupPlatform();
     puts("native input backpressure, ordered transitions, cancellation, overflow and cursor/control isolation: pass");
