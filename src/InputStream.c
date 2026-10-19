@@ -1,8 +1,10 @@
 #include "Limelight-internal.h"
 
 #include "plank_transport_input.h"
+#include <stdatomic.h>
 
-static bool initialized;
+static atomic_bool initialized;
+static atomic_bool inputFailed;
 
 static PlankNativeInputSender nativeInputSender;
 static void* nativeInputSenderContext;
@@ -83,6 +85,7 @@ static struct {
 
 // Initializes the input stream
 int initializeInputStream(void) {
+    inputFailed = false;
     // Set a high maximum queue size limit to ensure input isn't dropped
     // while the input send thread is blocked for short periods.
     LbqInitializeLinkedBlockingQueue(&packetQueue, MAX_QUEUED_INPUT_PACKETS);
@@ -188,6 +191,25 @@ static bool canBatchPenEvent(const void* data, const void* context) {
            next->packet.pen.eventType == current->packet.pen.eventType;
 }
 
+// Once an ordered transition cannot be retained, stop the session so the
+// Host releases input. Continuing would leave an unknowably stuck button/tip.
+static void failInput(int error) {
+    if (!atomic_exchange(&inputFailed, true)) {
+        LbqSignalQueueShutdown(&packetQueue);
+        ListenerCallbacks.connectionTerminated(error < 0 ? error : -1);
+    }
+}
+
+static int offerInputPacket(PPACKET_HOLDER holder) {
+    int result = LbqOfferQueueItemTimed(&packetQueue, holder, &holder->entry,
+                                        100, NULL, NULL);
+    if (result == LBQ_BOUND_EXCEEDED) {
+        Limelog("Input queue remained full; stopping rather than losing a transition\n");
+        failInput(-1);
+    }
+    return result;
+}
+
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     SOCK_RET err;
 
@@ -288,11 +310,26 @@ static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
         if (variablePayload == NULL) {
             variablePayload = payload;
         }
-        err = (SOCK_RET)nativeInputSender(
-            nativeInputSenderContext, type, variablePayload, payloadLength);
-        if (err < 0) {
+        const uint64_t deadline = PltGetMillis() + 2000;
+        do {
+            err = (SOCK_RET)nativeInputSender(
+                nativeInputSenderContext, type, variablePayload, payloadLength);
+            if (err != LI_PLANK_INPUT_WOULD_BLOCK) {
+                break;
+            }
+            // Keep this exact packet (and its ordering) until accepted. A
+            // positive WOULD_BLOCK result does not transfer payload ownership.
+            if (!initialized || inputFailed) {
+                return false;
+            }
+            if (PltGetMillis() >= deadline) {
+                break;
+            }
+            PltSleepMs(1);
+        } while (true);
+        if (err != 0) {
             Limelog("Native KyProto input send failed: %d\n", (int)err);
-            ListenerCallbacks.connectionTerminated(err);
+            failInput(err);
             return false;
         }
         return true;
@@ -639,9 +676,9 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 
         // Remaining fields are set in the input thread based on the latest currentRelativeMouseState values
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = offerInputPacket(holder);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
             Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
 
@@ -691,11 +728,13 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
     holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
     holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
 
-    err = LbqOfferQueueItemReplacingTail(&packetQueue, holder, &holder->entry,
-                                         isAbsoluteMousePosition,
-                                         (void**)&replacedHolder);
+    err = LbqOfferQueueItemTimed(&packetQueue, holder, &holder->entry, 100,
+                                isAbsoluteMousePosition, (void**)&replacedHolder);
+    if (err == LBQ_BOUND_EXCEEDED) {
+        failInput(-1);
+    }
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -746,9 +785,9 @@ int LiSendMouseButtonEvent(char action, int button) {
     holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
     holder->packet.mouseButton.button = (uint8_t)button;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -784,9 +823,9 @@ int LiSendKeyboardEvent2(short keyCode, char keyAction, char modifiers, char fla
     holder->packet.keyboard.modifiers = modifiers;
     holder->packet.keyboard.zero2 = 0;
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -816,9 +855,9 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
     holder->packet.unicode.header.magic = LE32(UTF8_TEXT_EVENT_MAGIC);
     memcpy(holder->packet.unicode.text, text, length);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -850,9 +889,9 @@ int LiSendRawHidEvent(const unsigned char* data, unsigned int length) {
     holder->packet.rawHid.header.magic = LE32(SS_RAW_HID_MAGIC);
     memcpy(holder->packet.rawHid.data, data, length);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -971,9 +1010,9 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
 
     if (enqueueHolder) {
         // Enqueue the new packet holder
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = offerInputPacket(holder);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
             Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
         }
@@ -1037,9 +1076,9 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
         holder->packet.scroll.zero3 = 0;
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = offerInputPacket(holder);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
             Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
         }
@@ -1078,9 +1117,9 @@ int LiSendHighResHScrollEvent(short scrollAmount) {
     holder->packet.hscroll.header.magic = LE32(SS_HSCROLL_MAGIC);
     holder->packet.hscroll.scrollAmount = BE16(scrollAmount);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -1123,9 +1162,9 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, fl
     floatToNetfloat(contactAreaMajor, holder->packet.touch.contactAreaMajor);
     floatToNetfloat(contactAreaMinor, holder->packet.touch.contactAreaMinor);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -1171,9 +1210,9 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
     floatToNetfloat(contactAreaMajor, holder->packet.pen.contactAreaMajor);
     floatToNetfloat(contactAreaMinor, holder->packet.pen.contactAreaMinor);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -1212,9 +1251,9 @@ int LiSendControllerArrivalEvent(uint8_t controllerNumber, uint16_t activeGamepa
         holder->packet.controllerArrival.capabilities = LE16(capabilities);
         holder->packet.controllerArrival.supportedButtonFlags = LE32(supportedButtonFlags);
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = offerInputPacket(holder);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
             Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
             return err;
@@ -1257,9 +1296,9 @@ int LiSendControllerTouchEvent2(uint8_t controllerNumber, uint8_t eventType, uin
     floatToNetfloat(y, holder->packet.controllerTouch.y);
     floatToNetfloat(pressure, holder->packet.controllerTouch.pressure);
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
@@ -1320,9 +1359,9 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
 
         // Remaining fields are set in the input thread based on the latest currentGamepadSensorState values
 
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        err = offerInputPacket(holder);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
             Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
 
@@ -1365,9 +1404,9 @@ int LiSendControllerBatteryEvent(uint8_t controllerNumber, uint8_t batteryState,
     holder->packet.controllerBattery.batteryPercentage = batteryPercentage;
     memset(holder->packet.controllerBattery.zero, 0, sizeof(holder->packet.controllerBattery.zero));
 
-    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    err = offerInputPacket(holder);
     if (err != LBQ_SUCCESS) {
-        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
         Limelog("Input queue reached maximum size limit\n");
         freePacketHolder(holder);
     }
