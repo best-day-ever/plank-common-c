@@ -959,7 +959,10 @@ void LiSetPlankNativeControlSender(
 // Route PLANK keyboard, absolute mouse, scrolling, pen, and raw-HID
 // Wacom messages through Kyber's native reliable input protocol. The payload
 // is one complete plank_transport_input.h message and must be copied
-// before the callback returns. The sender is required for every session.
+// before a successful (zero) return. WOULD_BLOCK means nothing was accepted;
+// the caller retains and retries the same packet. Negative results are fatal.
+// The sender is required for every session.
+#define LI_PLANK_INPUT_WOULD_BLOCK 1
 typedef int(*PlankNativeInputSender)(void* context,
                                               uint8_t type,
                                               const unsigned char* payload,
