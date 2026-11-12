@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <stdatomic.h>
 
 // Uncomment to test 3 byte Annex B start sequences with GFE
 //#define FORCE_3_BYTE_START_SEQUENCES
@@ -14,8 +15,26 @@ static uint16_t frameHostProcessingLatency;
 static uint64_t frameReceiveTimeUs;
 static uint64_t framePresentationTimeUs;
 static uint32_t frameTimestamp90Khz;
-static bool dropStatePending;
+// The decoder posts refresh requests; only the receive thread owns parser and
+// reference-chain state. Never let a concurrent request be lost while consuming
+// an earlier one at a complete-frame boundary.
+static atomic_bool dropStatePending;
 static bool idrFrameProcessed;
+
+#define NATIVE_IDR_RETRY_INTERVAL_MS 1000
+static bool nativeIdrRequestSent;
+static uint64_t lastNativeIdrRequestMs;
+
+static void requestNativeIdrIfDue(uint64_t now) {
+    if (!nativeIdrRequestSent || now - lastNativeIdrRequestMs >= NATIVE_IDR_RETRY_INTERVAL_MS) {
+        if (nativeIdrRequestSent) {
+            Limelog("Native video recovery: retrying IDR while complete frames await a keyframe\n");
+        }
+        nativeIdrRequestSent = true;
+        lastNativeIdrRequestMs = now;
+        LiRequestIdrFrame();
+    }
+}
 
 #define DR_CLEANUP -1000
 
@@ -60,8 +79,11 @@ void initializeVideoFrameAssembler(void) {
     frameReceiveTimeUs = 0;
     framePresentationTimeUs = 0;
     frameTimestamp90Khz = 0;
-    dropStatePending = false;
+    atomic_store(&dropStatePending, false);
     idrFrameProcessed = false;
+    consecutiveFrameDrops = 0;
+    nativeIdrRequestSent = false;
+    lastNativeIdrRequestMs = 0;
 }
 
 // Free the NAL chain
@@ -81,7 +103,6 @@ static void cleanupFrameState(void) {
 
 // Cleanup frame state and set that we're waiting for an IDR Frame
 static void dropFrameState(void) {
-    dropStatePending = false;
     waitingForIdrFrame = true;
 
     // Count the number of consecutive frames dropped
@@ -435,7 +456,8 @@ static void reassembleFrame(int frameNumber) {
             nalChainDataLength = 0;
 
             if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-                if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
+                const int queueResult = LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry);
+                if (queueResult == LBQ_BOUND_EXCEEDED) {
                     Limelog("Video decode unit queue overflow\n");
 
                     // RFI recovery is not supported here
@@ -453,7 +475,13 @@ static void reassembleFrame(int frameNumber) {
                     freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
 
                     // Request an IDR frame to recover
-                    LiRequestIdrFrame();
+                    requestNativeIdrIfDue(PltGetMillis());
+                    return;
+                }
+                else if (queueResult != LBQ_SUCCESS) {
+                    // Shutdown/drain did not take ownership. Release the DU
+                    // without scheduling recovery for a connection that ended.
+                    LiCompleteVideoFrame(qdu, DR_CLEANUP);
                     return;
                 }
             }
@@ -620,8 +648,12 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
     // The native receiver is the sole frame producer on this data plane. A
     // decoder refresh may still request a deferred state drop from the control
     // thread, so honor it only at this complete-frame boundary.
-    if (dropStatePending) {
+    if (atomic_exchange(&dropStatePending, false)) {
         dropFrameState();
+        // The decoder already requested an IDR. Start its response deadline
+        // here, on the sole owner of the recovery timer.
+        nativeIdrRequestSent = true;
+        lastNativeIdrRequestMs = PltGetMillis();
     }
 
     // A gap can come from transport loss OR sender-side recovery skips. An
@@ -637,11 +669,15 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
         if (!keyFrame) {
             // The assembler requires an IDR, not reference invalidation, and
             // must schedule only one request for this discontinuity.
-            LiRequestIdrFrame();
+            requestNativeIdrIfDue(PltGetMillis());
         }
     }
 
     if (waitingForIdrFrame && !keyFrame) {
+        // A sent request is not proof that a usable keyframe arrived. Native
+        // delta frames bypass dropFrameState(), so its frame-count limit never
+        // repaired a lost response here. Retry by time, including idle streams.
+        requestNativeIdrIfDue(PltGetMillis());
         nextFrameNumber = frameNumber + 1;
         return 1;
     }
@@ -669,6 +705,7 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
             waitingForIdrFrame = true;
             return -1;
         }
+        nativeIdrRequestSent = false;
     }
     else {
         queueFragment(currentPos.data, 0, frameLength);
@@ -686,17 +723,16 @@ int LiSubmitPlankVideoFrame(const unsigned char* frame,
 // Dumps the decode unit queue and ensures the next frame submitted to the decoder will be
 // an IDR frame
 void requestDecoderRefresh(void) {
-    // Wait for the next IDR frame
-    waitingForIdrFrame = true;
-
-    // Flush the decode unit queue
+    // Flush before publishing the refresh. Otherwise the receiver could consume
+    // the pending flag and enqueue the replacement IDR, only for this flush to
+    // discard it after the reference-chain gate has already reopened.
     freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
 
     // Request the receive thread drop its state
     // on the next call. We can't do it here because
     // it may be trying to queue DUs and we'll nuke
     // the state out from under it.
-    dropStatePending = true;
+    atomic_store(&dropStatePending, true);
 
     // Request the IDR frame
     LiRequestIdrFrame();
