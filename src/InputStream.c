@@ -1,7 +1,10 @@
 #include "Limelight-internal.h"
 
 #include "plank_transport_input.h"
+#include "plank_transport_pointer.h"
 #include <stdatomic.h>
+
+#define PLANK_POINTER_INPUT_MAGIC 0x5500000aU
 
 static atomic_bool initialized;
 static atomic_bool inputFailed;
@@ -297,6 +300,11 @@ static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
             type = PLANK_TRANSPORT_INPUT_RAW_HID_WACOM;
             variablePayload = holder->packet.rawHid.data;
             payloadLength = PACKET_SIZE(holder) - (sizeof(SS_RAW_HID_PACKET) - 1);
+            break;
+        case PLANK_POINTER_INPUT_MAGIC:
+            type = PLANK_TRANSPORT_INPUT_POINTER_CAPTURE;
+            variablePayload = holder->packet.rawHid.data;
+            payloadLength = PLANK_POINTER_PACKET_SIZE;
             break;
         case MOUSE_MOVE_REL_MAGIC_GEN5:
         case ENABLE_HAPTICS_MAGIC:
@@ -896,6 +904,25 @@ int LiSendRawHidEvent(const unsigned char* data, unsigned int length) {
         freePacketHolder(holder);
     }
 
+    return err;
+}
+
+int LiSendPlankPointerCapture(const unsigned char* data, unsigned int length) {
+    PlankPointerPacket packet;
+    PPACKET_HOLDER holder;
+    int err;
+    if (!initialized || nativeInputSender == NULL) return -2;
+    if (plank_pointer_decode(data, length, &packet) != 0 ||
+        packet.operation == PLANK_POINTER_END_ACK) return -4;
+    holder = allocatePacketHolder((int)length);
+    if (holder == NULL) return -1;
+    holder->packet.rawHid.header.size = BE32(sizeof(uint32_t) + length);
+    holder->packet.rawHid.header.magic = LE32(PLANK_POINTER_INPUT_MAGIC);
+    memcpy(holder->packet.rawHid.data, data, length);
+    /* Never coalesce these records: BEGIN, movement, buttons and END share
+     * one queue and must retain their exact transaction ordering. */
+    err = offerInputPacket(holder);
+    if (err != LBQ_SUCCESS) freePacketHolder(holder);
     return err;
 }
 
