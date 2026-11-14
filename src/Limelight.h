@@ -1057,6 +1057,10 @@ int LiSetVideoBitrate(int bitrateKbps);
 // Sunshine host over the reliable encrypted control stream.
 int LiSendRawHidEvent(const unsigned char* data, unsigned int length);
 
+// Queue one negotiated PLANK pointer transaction record on the same ordered
+// input stream as mouse buttons. No legacy or accelerated relative fallback.
+int LiSendPlankPointerCapture(const unsigned char* data, unsigned int length);
+
 #ifdef __cplusplus
 }
 #endif

@@ -31,6 +31,7 @@ function(add_plank_input_test name source)
 endfunction()
 
 add_plank_input_test(plank-native-input-wire native-input-wire.c)
+add_plank_input_test(plank-pointer-capture pointer-capture.c)
 add_plank_input_test(plank-native-input-bounds native-input-bounds.c)
 add_plank_input_test(plank-native-input-backpressure native-input-backpressure.c)
 add_plank_input_test(plank-queue-ownership queue-ownership.c)
